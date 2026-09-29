@@ -17,3 +17,5 @@ Do not commit either secret to GitHub.
 
 Mention Dr. Chappy in Slack and receive a fixed reply.
 AI-generated replies will be added only after this transport path works.
+
+deployment test
