@@ -1,9 +1,12 @@
 {
   "name": "dr-chappy",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Dr. Chappy Slack bot bridge on Vercel",
   "engines": {
     "node": "22.x"
+  },
+  "dependencies": {
+    "@vercel/functions": "^3.1.0"
   }
 }
