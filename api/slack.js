@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { waitUntil } from "@vercel/functions";
 
 export const config = { api: { bodyParser: false } };
 
@@ -16,18 +17,15 @@ async function readRawBody(req) {
 
 function verifySlackRequest(req, rawBody) {
   if (!SLACK_SIGNING_SECRET) return false;
-
   const timestamp = req.headers["x-slack-request-timestamp"];
   const slackSignature = req.headers["x-slack-signature"];
   if (!timestamp || !slackSignature) return false;
   if (Math.abs(Date.now() / 1000 - Number(timestamp)) > 300) return false;
 
-  const expected =
-    "v0=" +
-    crypto
-      .createHmac("sha256", SLACK_SIGNING_SECRET)
-      .update(`v0:${timestamp}:${rawBody}`, "utf8")
-      .digest("hex");
+  const expected = "v0=" + crypto
+    .createHmac("sha256", SLACK_SIGNING_SECRET)
+    .update(`v0:${timestamp}:${rawBody}`, "utf8")
+    .digest("hex");
 
   try {
     return crypto.timingSafeEqual(
@@ -39,8 +37,14 @@ function verifySlackRequest(req, rawBody) {
   }
 }
 
+function removeBotMention(text = "") {
+  return text.replace(/<@[A-Z0-9]+(?:\|[^>]+)?>/g, "").trim();
+}
+
 async function askOpenAI(userText) {
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing");
+
+  console.log("BRAIN calling OpenAI");
 
   const response = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -58,12 +62,14 @@ async function askOpenAI(userText) {
 
   const data = await response.json();
 
+  console.log("BRAIN OpenAI result", {
+    status: response.status,
+    ok: response.ok,
+    error: data?.error?.message || null,
+  });
+
   if (!response.ok) {
-    console.error("OpenAI API error", {
-      status: response.status,
-      error: data?.error?.message || data?.error || "unknown_error",
-    });
-    throw new Error(`OpenAI API error: ${response.status}`);
+    throw new Error(`OpenAI API ${response.status}: ${data?.error?.message || "unknown_error"}`);
   }
 
   if (data.output_text) return data.output_text;
@@ -74,11 +80,12 @@ async function askOpenAI(userText) {
     ?.map((item) => item?.text)
     ?.join("\n");
 
-  return text || "社長、回答の生成には成功しましたが、文章を取り出せませんでした🤖";
+  if (!text) throw new Error("OpenAI returned no output text");
+  return text;
 }
 
 async function postToSlack(channel, text, threadTs) {
-  if (!SLACK_BOT_TOKEN) throw new Error("SLACK_BOT_TOKEN is missing");
+  console.log("BRAIN posting to Slack");
 
   const response = await fetch("https://slack.com/api/chat.postMessage", {
     method: "POST",
@@ -94,11 +101,41 @@ async function postToSlack(channel, text, threadTs) {
   });
 
   const data = await response.json();
-  if (!data.ok) throw new Error(`Slack API error: ${data.error || "unknown_error"}`);
+
+  console.log("BRAIN Slack result", {
+    status: response.status,
+    ok: data.ok,
+    error: data.error || null,
+  });
+
+  if (!data.ok) throw new Error(`Slack API: ${data.error || "unknown_error"}`);
 }
 
-function removeBotMention(text = "") {
-  return text.replace(/<@[A-Z0-9]+>/g, "").trim();
+async function handleMention(event) {
+  const userText = removeBotMention(event.text);
+  console.log("BRAIN mention received", {
+    channel: event.channel,
+    textLength: userText.length,
+  });
+
+  try {
+    const answer = await askOpenAI(
+      userText || "社長から呼ばれました。短く挨拶してください。"
+    );
+    await postToSlack(event.channel, answer, event.thread_ts || event.ts);
+    console.log("BRAIN job complete");
+  } catch (error) {
+    console.error("BRAIN job failed:", error?.message);
+    try {
+      await postToSlack(
+        event.channel,
+        "社長、脳みそとの通信でエラーが出ました🤖💦 ログには原因を残してあります。",
+        event.thread_ts || event.ts
+      );
+    } catch (fallbackError) {
+      console.error("BRAIN fallback failed:", fallbackError?.message);
+    }
+  }
 }
 
 export default async function handler(req, res) {
@@ -107,6 +144,7 @@ export default async function handler(req, res) {
       ok: true,
       service: "Dr. Chappy",
       brain: "OpenAI",
+      backgroundJobs: true,
     });
   }
 
@@ -140,41 +178,11 @@ export default async function handler(req, res) {
   if (body?.type === "event_callback") {
     const event = body.event;
 
-    if (event?.bot_id) {
-      return res.status(200).json({ ok: true });
-    }
+    if (event?.bot_id) return res.status(200).json({ ok: true });
 
     if (event?.type === "app_mention") {
-      // Slackへの受領応答は先に返す
-      res.status(200).json({ ok: true });
-
-      const userText = removeBotMention(event.text);
-
-      try {
-        const answer = await askOpenAI(
-          userText || "社長から呼ばれました。短く挨拶してください。"
-        );
-
-        await postToSlack(
-          event.channel,
-          answer,
-          event.thread_ts || event.ts
-        );
-      } catch (error) {
-        console.error("Dr. Chappy error:", error?.message);
-
-        try {
-          await postToSlack(
-            event.channel,
-            "社長、脳みそとの通信でエラーが出ました🤖💦 Vercelのログを確認してください。",
-            event.thread_ts || event.ts
-          );
-        } catch (postError) {
-          console.error("Fallback Slack post failed:", postError?.message);
-        }
-      }
-
-      return;
+      waitUntil(handleMention(event));
+      return res.status(200).json({ ok: true });
     }
   }
 
